@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef } from 'react';
+import { useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Summary, Highlight } from '@/types';
@@ -115,6 +115,22 @@ export default function SummaryPanel({
 }: SummaryPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const { summaries, status, isLoading, isGenerating, error, generateSummary, generateAll } = useSummaries(bookId);
+
+  // Auto-select summary when currentPage changes
+  useEffect(() => {
+    if (summaries.length === 0 || !onSummaryClick) return;
+
+    // Find summary for current page
+    const matchingSummary = summaries.find(s =>
+      currentPage >= s.page_start && currentPage <= s.page_end
+    );
+
+    // Only update if we're not already on this summary
+    if (matchingSummary && (!activeSummary || activeSummary.id !== matchingSummary.id)) {
+      console.log(`[SummaryPanel] Auto-selecting summary for page ${currentPage}:`, matchingSummary);
+      onSummaryClick(matchingSummary);
+    }
+  }, [currentPage, summaries, activeSummary, onSummaryClick]);
 
   const handleScroll = () => {
     if (containerRef.current && onScroll) {

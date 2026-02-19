@@ -80,8 +80,15 @@ export default function ReaderPage({ params }: { params: Promise<{ bookId: strin
   const handlePageChange = useCallback((page: number) => {
     setCurrentPage(page);
     setHighlightedRegion(null);
-    setActiveSummary(null);
-  }, [setCurrentPage, setHighlightedRegion, setActiveSummary]);
+    // Don't clear activeSummary here - let navigation complete handle it
+    // This allows summary to stay visible during navigation
+  }, [setCurrentPage, setHighlightedRegion]);
+
+  const handleNavigationComplete = useCallback((page: number) => {
+    // Navigation completed - clear highlights and let SummaryPanel auto-select summary
+    setHighlightedRegion(null);
+    // The SummaryPanel will auto-select the appropriate summary based on currentPage
+  }, [setHighlightedRegion]);
 
   const handleSummaryClick = useCallback((summary: any) => {
     setActiveSummary(summary);
@@ -251,6 +258,7 @@ export default function ReaderPage({ params }: { params: Promise<{ bookId: strin
                 totalPages={book.total_pages}
                 currentPage={currentPage}
                 onPageChange={handlePageChange}
+                onNavigationComplete={handleNavigationComplete}
                 onScroll={handlePDFScroll}
                 highlightedRegion={highlightedRegion}
               />

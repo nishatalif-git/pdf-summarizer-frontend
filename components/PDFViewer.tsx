@@ -21,12 +21,17 @@ interface PDFViewerProps {
   currentPage: number;
   onPageChange: (page: number) => void;
   onScroll?: (scrollTop: number, scrollHeight: number) => void;
+  onNavigationComplete?: (page: number) => void;
   highlightedRegion?: Highlight | null;
   scale?: number;
 }
 
-const PAGE_BUFFER = 5; // Number of pages to load before/after visible area (increased to reduce abort warnings)
-const SPACER_HEIGHT = 800; // Estimated height for unloaded pages
+const PAGE_BUFFER = 5;
+const SPACER_HEIGHT = 800;
+
+// Helper functions for localStorage
+const getScrollKey = (bookId: number) => `pdf-scroll-${bookId}`;
+const getPageKey = (bookId: number) => `pdf-page-${bookId}`;
 
 const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
   bookId,
@@ -34,12 +39,29 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
   currentPage,
   onPageChange,
   onScroll,
+  onNavigationComplete,
   highlightedRegion,
   scale = 1.0,
 }, ref) {
+  // === REFS ===
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLElement>>(new Map());
   const pageHeights = useRef<Map<number, number>>(new Map());
+
+  // Ref for displayPage to avoid stale closures in setTimeout
+  const displayPageRef = useRef(currentPage);
+
+  // Navigation state refs
+  const isNavigatingRef = useRef(false);
+  const navigationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pageLoadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const summaryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastLoadedPageRef = useRef(0);
+  const lastSummaryPageRef = useRef(0);
+  const saveScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadedPagesRef = useRef<Set<number>>(new Set([1]));
+
+  // === STATE ===
   const [pdfUrl, setPdfUrl] = useState<string>('');
   const [numPages, setNumPages] = useState<number>(totalPages);
   const [containerWidth, setContainerWidth] = useState<number>(0);
@@ -47,30 +69,41 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
   const [isEditing, setIsEditing] = useState(false);
   const [loadedPages, setLoadedPages] = useState<Set<number>>(new Set([1]));
   const [viewportRange, setViewportRange] = useState<{ start: number; end: number }>({ start: 1, end: 1 });
-  const isProgrammaticScrollRef = useRef(false); // Track programmatic scrolls
-  const programmaticScrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const scrollEndTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const targetPageRef = useRef<number | null>(null); // Track the target page from programmatic navigation
-  const loadedPagesRef = useRef<Set<number>>(new Set([1])); // Ref to loadedPages to avoid dependency issues
-  const [isDraggingScrollbar, setIsDraggingScrollbar] = useState(false);
-  const scrollbarTrackRef = useRef<HTMLDivElement>(null);
+  const [scrollRatio, setScrollRatio] = useState<number>(0);
+  const [displayPage, setDisplayPage] = useState<number>(currentPage);
 
-  // Keep the ref in sync with state
+  // === SYNC displayPage WITH currentPage PROP ===
+  useEffect(() => {
+    // Only update displayPage from prop if we're not in the middle of navigation
+    if (!isNavigatingRef.current && displayPageRef.current !== currentPage) {
+      displayPageRef.current = currentPage;
+      setDisplayPage(currentPage);
+      // Also update page input immediately
+      if (!isEditing) {
+        setPageInput(currentPage.toString());
+      }
+    }
+  }, [currentPage, isEditing]);
+
+  // Keep displayPageRef in sync with state
+  useEffect(() => {
+    displayPageRef.current = displayPage;
+  }, [displayPage]);
+
+  // Keep loadedPagesRef in sync with state (separate effect to avoid dependency issues)
   useEffect(() => {
     loadedPagesRef.current = loadedPages;
   }, [loadedPages]);
 
+  // === INITIALIZE ===
   useEffect(() => {
     setPdfUrl(bookApi.getFileUrl(bookId));
-
-    // Cleanup timeouts on unmount
     return () => {
-      if (programmaticScrollTimeoutRef.current) {
-        clearTimeout(programmaticScrollTimeoutRef.current);
-      }
-      if (scrollEndTimeoutRef.current) {
-        clearTimeout(scrollEndTimeoutRef.current);
-      }
+      // Cleanup all timeouts
+      if (navigationTimeoutRef.current) clearTimeout(navigationTimeoutRef.current);
+      if (pageLoadTimeoutRef.current) clearTimeout(pageLoadTimeoutRef.current);
+      if (summaryTimeoutRef.current) clearTimeout(summaryTimeoutRef.current);
+      if (saveScrollTimeoutRef.current) clearTimeout(saveScrollTimeoutRef.current);
     };
   }, [bookId]);
 
@@ -85,101 +118,58 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
     return () => window.removeEventListener('resize', updateWidth);
   }, []);
 
-  // Update page input when currentPage changes
+  // Update page input display
   useEffect(() => {
     if (!isEditing) {
-      setPageInput(currentPage.toString());
+      setPageInput(displayPage.toString());
     }
-  }, [currentPage, isEditing]);
+  }, [displayPage, isEditing]);
 
-  // Calculate which pages should be loaded based on scroll position
-  const updateLoadedPages = useCallback(() => {
-    if (!containerRef.current || numPages === 0) return;
+  // Save to localStorage (debounced)
+  const saveToLocalStorage = useCallback((scrollTop: number, page: number) => {
+    localStorage.setItem(getScrollKey(bookId), scrollTop.toString());
+    localStorage.setItem(getPageKey(bookId), page.toString());
+  }, [bookId]);
 
-    const container = containerRef.current;
-    const scrollTop = container.scrollTop;
-    const viewportHeight = container.clientHeight;
-    const scrollHeight = container.scrollHeight;
+  // Save current page to localStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const pageKey = getPageKey(bookId);
+    localStorage.setItem(pageKey, currentPage.toString());
+  }, [bookId, currentPage]);
 
-    // Calculate scroll ratio (0 to 1)
-    const scrollRatio = scrollHeight > 0 ? scrollTop / scrollHeight : 0;
+  // === LOAD PAGES AROUND TARGET ===
+  const loadPagesAround = useCallback((targetPage: number) => {
+    const startPage = Math.max(1, targetPage - PAGE_BUFFER);
+    const endPage = Math.min(numPages, targetPage + PAGE_BUFFER);
 
-    // Estimate which page should be visible based on scroll ratio
-    // This works even when pages aren't loaded yet
-    const estimatedPage = Math.min(numPages, Math.max(1, Math.ceil(scrollRatio * numPages)));
-
-    // Get current loaded pages as array from ref
+    // Read from ref to avoid dependency on state
     const currentLoadedPages = loadedPagesRef.current;
-    const loadedPagesArray = Array.from(currentLoadedPages).sort((a, b) => a - b);
+    const newLoadedPages = new Set<number>();
 
-    // Find which LOADED page is closest to the viewport
-    let currentViewportPage = estimatedPage;
+    // Keep existing loaded pages
+    for (const page of currentLoadedPages) {
+      newLoadedPages.add(page);
+    }
+    // Add new range
+    for (let i = startPage; i <= endPage; i++) {
+      newLoadedPages.add(i);
+    }
+
+    setLoadedPages(newLoadedPages);
+    setViewportRange({ start: startPage, end: endPage });
+  }, [numPages]);
+
+  // === FIND PAGE CLOSEST TO VIEWPORT CENTER ===
+  const findPageAtViewportCenter = useCallback((scrollTop: number, viewportHeight: number): number => {
+    const containerCenter = scrollTop + viewportHeight / 2;
+    let closestPage = 1;
     let minDistance = Infinity;
 
-    if (loadedPagesArray.length > 0) {
-      for (const pageNum of loadedPagesArray) {
-        const pageEl = pageRefs.current.get(pageNum);
-        if (pageEl) {
-          const pageTop = pageEl.offsetTop;
+    // Read from ref to avoid dependency on state
+    const currentLoadedPages = loadedPagesRef.current;
 
-          // Check if this page is in or near the viewport
-          const distance = Math.abs(pageTop - scrollTop);
-          if (distance < minDistance) {
-            minDistance = distance;
-            currentViewportPage = pageNum;
-          }
-        }
-      }
-    }
-
-    // Calculate range of pages to keep loaded - limit the range
-    const startPage = Math.max(1, currentViewportPage - PAGE_BUFFER);
-    const endPage = Math.min(numPages, currentViewportPage + PAGE_BUFFER);
-
-    // Calculate what we SHOULD have loaded
-    const shouldLoad = new Set<number>();
-    for (let i = startPage; i <= endPage; i++) {
-      shouldLoad.add(i);
-    }
-
-    // Only update if the loaded pages are significantly different
-    // This prevents unnecessary updates and loading loops
-    const minDiffForUpdate = 2; // Only update if at least 2 pages differ
-
-    let diffCount = 0;
-    for (const page of shouldLoad) {
-      if (!currentLoadedPages.has(page)) diffCount++;
-    }
-    for (const page of currentLoadedPages) {
-      if (!shouldLoad.has(page)) diffCount++;
-    }
-
-    if (diffCount >= minDiffForUpdate) {
-      setViewportRange({ start: startPage, end: endPage });
-      setLoadedPages(shouldLoad);
-    }
-
-    // Skip updating page during programmatic scroll - let navigateToPage handle it
-    if (isProgrammaticScrollRef.current) {
-      return;
-    }
-
-    // If we have a target page from programmatic navigation, only update if we're close to it
-    if (targetPageRef.current !== null) {
-      // Only clear the target if we've reached it (within 1 page)
-      const distanceToTarget = Math.abs(currentViewportPage - targetPageRef.current);
-      if (distanceToTarget <= 1) {
-        targetPageRef.current = null;
-      }
-      return; // Don't update page while target is set
-    }
-
-    // Update current page based on center of viewport
-    const containerCenter = scrollTop + viewportHeight / 2;
-    let closestPage = currentViewportPage;
-    minDistance = Infinity;
-
-    for (const pageNum of loadedPagesArray) {
+    for (const pageNum of currentLoadedPages) {
       const pageEl = pageRefs.current.get(pageNum);
       if (pageEl) {
         const pageCenter = pageEl.offsetTop + (pageEl.offsetHeight || SPACER_HEIGHT) / 2;
@@ -191,68 +181,192 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
       }
     }
 
-    if (closestPage !== currentPage) {
-      onPageChange(closestPage);
-    }
-  }, [currentPage, numPages, onPageChange]);
+    return closestPage;
+  }, []);
 
-  // Debounced scroll handler
+  // === SCROLL TO PAGE ===
+  const scrollToPage = useCallback((page: number) => {
+    if (!containerRef.current) return;
+
+    const pageEl = pageRefs.current.get(page);
+
+    if (page === 1) {
+      containerRef.current.scrollTop = 0;
+    } else if (page === numPages) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    } else if (pageEl) {
+      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      // Page not loaded - estimate position
+      const getPageOffset = (pageNum: number) => {
+        let offset = 0;
+        for (let i = 1; i < pageNum; i++) {
+          offset += pageHeights.current.get(i) || SPACER_HEIGHT;
+        }
+        return offset;
+      };
+      containerRef.current.scrollTop = getPageOffset(page);
+    }
+  }, [numPages]);
+
+  // === SINGLE UNIFIED SCROLL HANDLER ===
   useEffect(() => {
-    let timeoutId: NodeJS.Timeout;
+    const container = containerRef.current;
+    if (!container) return;
 
     const handleScroll = () => {
-      // Skip if this is a programmatic scroll
-      if (isProgrammaticScrollRef.current) {
+      const scrollTop = container.scrollTop;
+      const scrollHeight = container.scrollHeight;
+      const viewportHeight = container.clientHeight;
+
+      // Consistent scroll ratio calculation
+      const ratio = scrollHeight > viewportHeight
+        ? scrollTop / (scrollHeight - viewportHeight)
+        : 0;
+
+      // Calculate estimated page from scroll position
+      const estimatedPage = Math.min(numPages, Math.max(1, Math.ceil(ratio * (numPages - 1)) + 1));
+
+      // IMMEDIATE: Update UI state (aggressive)
+      setScrollRatio(ratio);
+      displayPageRef.current = estimatedPage;
+      setDisplayPage(estimatedPage);
+
+      // If navigating, don't process further
+      if (isNavigatingRef.current) {
         return;
       }
 
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => {
-        updateLoadedPages();
+      // Debounced page loading (200ms)
+      if (pageLoadTimeoutRef.current) clearTimeout(pageLoadTimeoutRef.current);
+      pageLoadTimeoutRef.current = setTimeout(() => {
+        const currentDisplayPage = displayPageRef.current;
 
-        if (containerRef.current && onScroll) {
-          const scrollTop = containerRef.current.scrollTop;
-          const scrollHeight = containerRef.current.scrollHeight - containerRef.current.clientHeight;
-          onScroll(scrollTop, scrollHeight);
+        // Only load if page changed
+        if (currentDisplayPage !== lastLoadedPageRef.current) {
+          lastLoadedPageRef.current = currentDisplayPage;
+
+          // Load pages around current position
+          loadPagesAround(currentDisplayPage);
+
+          // Find actual page at viewport center
+          const actualPage = findPageAtViewportCenter(scrollTop, viewportHeight);
+
+          // Only notify parent if page changed
+          if (actualPage !== currentPage) {
+            onPageChange(actualPage);
+          }
         }
-      }, 100); // Increased debounce for smoother scrollbar dragging
+
+        // Call onScroll callback
+        if (onScroll) {
+          onScroll(scrollTop, scrollHeight - viewportHeight);
+        }
+
+        // Debounced save to localStorage (500ms)
+        if (saveScrollTimeoutRef.current) clearTimeout(saveScrollTimeoutRef.current);
+        saveScrollTimeoutRef.current = setTimeout(() => {
+          saveToLocalStorage(scrollTop, displayPageRef.current);
+        }, 500);
+      }, 200);
+
+      // Debounced summary loading (800ms) - only when scroll truly stops
+      if (summaryTimeoutRef.current) clearTimeout(summaryTimeoutRef.current);
+      summaryTimeoutRef.current = setTimeout(() => {
+        const currentDisplayPage = displayPageRef.current;
+
+        // Only trigger summary if page changed
+        if (currentDisplayPage !== lastSummaryPageRef.current) {
+          lastSummaryPageRef.current = currentDisplayPage;
+          onNavigationComplete?.(currentDisplayPage);
+        }
+      }, 800);
     };
 
-    const container = containerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll, { passive: true });
-      return () => {
-        container.removeEventListener('scroll', handleScroll);
-        clearTimeout(timeoutId);
-      };
-    }
-  }, [updateLoadedPages, onScroll]);
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      if (pageLoadTimeoutRef.current) clearTimeout(pageLoadTimeoutRef.current);
+      if (summaryTimeoutRef.current) clearTimeout(summaryTimeoutRef.current);
+      if (saveScrollTimeoutRef.current) clearTimeout(saveScrollTimeoutRef.current);
+    };
+  }, [numPages, currentPage, loadPagesAround, findPageAtViewportCenter, onPageChange, onScroll, onNavigationComplete, saveToLocalStorage]);
 
-  const onDocumentLoadSuccess = ({ numPages }: { numPages: number }) => {
-    setNumPages(numPages);
-    setLoadedPages(new Set([1, 2, 3]));
-  };
+  // === RESTORE SCROLL POSITION ON MOUNT ===
+  useEffect(() => {
+    const restorePosition = () => {
+      if (!containerRef.current) return;
 
-  // Track page heights
+      const savedScrollTop = localStorage.getItem(getScrollKey(bookId));
+      const savedPage = localStorage.getItem(getPageKey(bookId));
+
+      if (savedPage) {
+        const pageNum = parseInt(savedPage, 10);
+        displayPageRef.current = pageNum;
+        setDisplayPage(pageNum);
+        loadPagesAround(pageNum);
+      }
+
+      if (savedScrollTop) {
+        containerRef.current.scrollTop = parseInt(savedScrollTop, 10);
+      }
+    };
+
+    // Try immediately
+    restorePosition();
+
+    // Also try after a delay (for document load)
+    const timeoutId = setTimeout(restorePosition, 100);
+
+    return () => clearTimeout(timeoutId);
+  }, [bookId, loadPagesAround]);
+
+  // === DOCUMENT LOAD HANDLER ===
+  const onDocumentLoadSuccess = useCallback(({ numPages: pages }: { numPages: number }) => {
+    setNumPages(pages);
+
+    // Load initial pages
+    const savedPage = localStorage.getItem(getPageKey(bookId));
+    const targetPage = savedPage ? parseInt(savedPage, 10) : 1;
+
+    loadPagesAround(targetPage);
+
+    // Restore position after pages render
+    setTimeout(() => {
+      if (containerRef.current) {
+        const savedScrollTop = localStorage.getItem(getScrollKey(bookId));
+        if (savedScrollTop) {
+          containerRef.current.scrollTop = parseInt(savedScrollTop, 10);
+        }
+
+        if (savedPage) {
+          const pageNum = parseInt(savedPage, 10);
+          displayPageRef.current = pageNum;
+          setDisplayPage(pageNum);
+          onPageChange(pageNum);
+        }
+      }
+    }, 500);
+  }, [bookId, loadPagesAround, onPageChange]);
+
+  // === PAGE LOAD HANDLERS ===
   const handlePageLoadSuccess = useCallback((pageNum: number) => {
     return () => {
       const pageEl = pageRefs.current.get(pageNum);
       if (pageEl) {
-        const height = pageEl.offsetHeight;
-        pageHeights.current.set(pageNum, height);
+        pageHeights.current.set(pageNum, pageEl.offsetHeight);
       }
     };
   }, []);
 
-  // Handle render errors (suppress AbortException warnings from cancelled renders)
   const handleRenderError = useCallback((error: Error) => {
-    // Ignore AbortException - it's expected when pages are unmounted during rendering
     if (error?.name === 'AbortException' || error?.message?.includes('aborted')) {
       return;
     }
     console.error('PDF render error:', error);
   }, []);
 
+  // === PAGE INPUT HANDLERS ===
   const handlePageInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setPageInput(e.target.value);
   };
@@ -261,95 +375,74 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
     if (e.key === 'Enter') {
       const page = parseInt(pageInput);
       if (!isNaN(page) && page >= 1 && page <= numPages) {
-        const startPage = Math.max(1, page - PAGE_BUFFER);
-        const endPage = Math.min(numPages, page + PAGE_BUFFER);
-        const newLoadedPages = new Set<number>();
-        for (let i = startPage; i <= endPage; i++) {
-          newLoadedPages.add(i);
-        }
-        setLoadedPages(newLoadedPages);
-        onPageChange(page);
         setIsEditing(false);
-
-        setTimeout(() => {
-          scrollToPage(page);
-        }, 100);
+        navigateToPage(page);
       } else {
-        setPageInput(currentPage.toString());
+        setPageInput(displayPage.toString());
         setIsEditing(false);
       }
     } else if (e.key === 'Escape') {
-      setPageInput(currentPage.toString());
+      setPageInput(displayPage.toString());
       setIsEditing(false);
     }
   };
 
   const handlePageInputFocus = () => {
     setIsEditing(true);
-    setPageInput(currentPage.toString());
   };
 
   const handlePageInputBlur = () => {
     const page = parseInt(pageInput);
     if (!isNaN(page) && page >= 1 && page <= numPages) {
-      onPageChange(page);
-      scrollToPage(page);
+      navigateToPage(page);
     } else {
-      setPageInput(currentPage.toString());
+      setPageInput(displayPage.toString());
     }
     setIsEditing(false);
   };
 
-  const scrollToPage = (page: number) => {
-    const pageEl = pageRefs.current.get(page);
-    if (pageEl && containerRef.current) {
-      // Set flag to block scroll handler during programmatic scroll
-      isProgrammaticScrollRef.current = true;
+  // === CORE NAVIGATION FUNCTION ===
+  const navigateToPage = useCallback((page: number) => {
+    if (page < 1 || page > numPages) return;
 
-      // Clear any existing timeouts
-      if (programmaticScrollTimeoutRef.current) {
-        clearTimeout(programmaticScrollTimeoutRef.current);
-      }
-      if (scrollEndTimeoutRef.current) {
-        clearTimeout(scrollEndTimeoutRef.current);
-      }
+    console.log(`[navigateToPage] Navigating to page ${page}`);
 
-      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    // Set navigating flag (blocks scroll handler processing)
+    isNavigatingRef.current = true;
 
-      // Keep flag set during smooth scroll, then clear after a longer delay
-      // Smooth scroll can take up to 2-3 seconds for large documents
-      programmaticScrollTimeoutRef.current = setTimeout(() => {
-        isProgrammaticScrollRef.current = false;
-      }, 3000);
+    // Clear any existing navigation timeout
+    if (navigationTimeoutRef.current) {
+      clearTimeout(navigationTimeoutRef.current);
     }
-  };
 
-  // Expose navigation method to parent component
+    // IMMEDIATE: Update UI state
+    const pageRatio = numPages > 1 ? (page - 1) / (numPages - 1) : 0;
+    setScrollRatio(pageRatio);
+    displayPageRef.current = page;
+    setDisplayPage(page);
+
+    // Load pages around target
+    loadPagesAround(page);
+
+    // Notify parent of page change
+    onPageChange(page);
+
+    // Scroll to the page
+    scrollToPage(page);
+
+    // Clear navigating flag and trigger navigation complete after scroll
+    navigationTimeoutRef.current = setTimeout(() => {
+      isNavigatingRef.current = false;
+      onNavigationComplete?.(page);
+    }, 1000); // Give smooth scroll time to complete
+  }, [numPages, loadPagesAround, onPageChange, scrollToPage, onNavigationComplete]);
+
+  // Expose navigation method to parent
   useImperativeHandle(ref, () => ({
-    navigateToPage: (page: number) => {
-      // Set the target page to prevent scroll-based updates from overriding it
-      targetPageRef.current = page;
+    navigateToPage: navigateToPage,
+  }), [navigateToPage]);
 
-      // Load pages around the target - create a fresh set like manual input does
-      const startPage = Math.max(1, page - PAGE_BUFFER);
-      const endPage = Math.min(numPages, page + PAGE_BUFFER);
-
-      const newLoadedPages = new Set<number>();
-      for (let i = startPage; i <= endPage; i++) {
-        newLoadedPages.add(i);
-      }
-      setLoadedPages(newLoadedPages);
-      // Note: Don't set viewportRange manually - let scroll handler update it naturally
-
-      // Update page state and scroll
-      onPageChange(page);
-
-      // Scroll to the page after a short delay to allow rendering
-      setTimeout(() => scrollToPage(page), 100);
-    },
-  }), [numPages, onPageChange]);
-
-  // Calculate total document height (known + estimated)
+  // === CALCULATIONS ===
   const totalHeight = useMemo(() => {
     let height = 0;
     for (let i = 1; i <= numPages; i++) {
@@ -358,16 +451,15 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
     return height;
   }, [numPages]);
 
-  // Calculate offset for each page
   const getPageOffset = useCallback((pageNum: number) => {
     let offset = 0;
     for (let i = 1; i < pageNum; i++) {
-      const height = pageHeights.current.get(i);
-      offset += height || SPACER_HEIGHT;
+      offset += pageHeights.current.get(i) || SPACER_HEIGHT;
     }
     return offset;
-  }, []); // Empty deps - this will recalculate when pageHeights changes due to render
+  }, []);
 
+  // === RENDER ===
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg-secondary)' }}>
       {/* Toolbar */}
@@ -381,27 +473,20 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           <button
-            onClick={() => {
-              const newPage = Math.max(1, currentPage - 1);
-              onPageChange(newPage);
-              scrollToPage(newPage);
-            }}
-            disabled={currentPage <= 1}
+            onClick={() => navigateToPage(Math.max(1, displayPage - 1))}
+            disabled={displayPage <= 1}
             className="btn btn-ghost"
             style={{ padding: '0.375rem 0.5rem' }}
           >
             ←
           </button>
 
-          {/* Page Input */}
           <div style={{
             display: 'flex',
             alignItems: 'center',
             gap: '0.25rem',
             padding: '0.25rem 0.5rem',
-            background: isEditing
-              ? 'var(--bg-secondary)'
-              : 'var(--bg-tertiary)',
+            background: isEditing ? 'var(--bg-secondary)' : 'var(--bg-tertiary)',
             borderRadius: '0.5rem',
             borderWidth: isEditing ? '1px' : '1px',
             borderStyle: 'solid',
@@ -427,21 +512,14 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
                 fontWeight: 600,
               }}
             />
-            <span style={{
-              fontSize: '0.75rem',
-              color: 'var(--text-muted)',
-            }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
               / {numPages}
             </span>
           </div>
 
           <button
-            onClick={() => {
-              const newPage = Math.min(numPages, currentPage + 1);
-              onPageChange(newPage);
-              scrollToPage(newPage);
-            }}
-            disabled={currentPage >= numPages}
+            onClick={() => navigateToPage(Math.min(numPages, displayPage + 1))}
+            disabled={displayPage >= numPages}
             className="btn btn-ghost"
             style={{ padding: '0.375rem 0.5rem' }}
           >
@@ -451,20 +529,14 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
 
         <div style={{ display: 'flex', gap: '0.25rem' }}>
           <button
-            onClick={() => {
-              onPageChange(1);
-              scrollToPage(1);
-            }}
+            onClick={() => navigateToPage(1)}
             className="btn btn-ghost"
             style={{ padding: '0.375rem 0.5rem', fontSize: '0.75rem' }}
           >
             First
           </button>
           <button
-            onClick={() => {
-              onPageChange(numPages);
-              scrollToPage(numPages);
-            }}
+            onClick={() => navigateToPage(numPages)}
             className="btn btn-ghost"
             style={{ padding: '0.375rem 0.5rem', fontSize: '0.75rem' }}
           >
@@ -473,11 +545,8 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
         </div>
       </div>
 
-      {/* PDF Container - Virtual scroll */}
-      <div
-        ref={containerRef}
-        style={{ flex: 1, overflow: 'auto', padding: '1rem' }}
-      >
+      {/* PDF Container */}
+      <div ref={containerRef} style={{ flex: 1, overflow: 'auto', padding: '1rem' }}>
         {pdfUrl ? (
           <Document
             file={pdfUrl}
@@ -485,12 +554,9 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
             loading={<div className="spinner" />}
           >
             <div style={{ position: 'relative', minWidth: '100%' }}>
-              {/* Top spacer for unloaded pages */}
+              {/* Top spacer */}
               {viewportRange.start > 1 && (
-                <div style={{
-                  height: getPageOffset(viewportRange.start),
-                  minWidth: '100%'
-                }} />
+                <div style={{ height: getPageOffset(viewportRange.start), minWidth: '100%' }} />
               )}
 
               {/* Loaded pages */}
@@ -533,12 +599,9 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
                 </div>
               ))}
 
-              {/* Bottom spacer for unloaded pages */}
+              {/* Bottom spacer */}
               {viewportRange.end < numPages && (
-                <div style={{
-                  height: getPageOffset(numPages + 1) - getPageOffset(viewportRange.end + 1),
-                  minWidth: '100%'
-                }} />
+                <div style={{ height: getPageOffset(numPages + 1) - getPageOffset(viewportRange.end + 1), minWidth: '100%' }} />
               )}
             </div>
           </Document>
@@ -547,7 +610,7 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
         )}
       </div>
 
-      {/* Enhanced Page Scrollbar */}
+      {/* Page Scrollbar */}
       <div style={{
         padding: '0.75rem 1rem',
         background: 'var(--bg-primary)',
@@ -556,9 +619,7 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Page</span>
 
-          {/* Custom scrollbar container */}
           <div
-            ref={scrollbarTrackRef}
             style={{
               flex: 1,
               position: 'relative',
@@ -568,54 +629,29 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
               cursor: 'pointer',
             }}
             onClick={(e) => {
-              // Only handle click on the track, not on the thumb
-              if (e.target !== scrollbarTrackRef.current) return;
-
-              if (!scrollbarTrackRef.current) return;
-
-              const trackRect = scrollbarTrackRef.current.getBoundingClientRect();
-              const percentage = Math.max(0, Math.min(1, (e.clientX - trackRect.left) / trackRect.width));
+              const rect = e.currentTarget.getBoundingClientRect();
+              const percentage = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
               const targetPage = Math.max(1, Math.min(numPages, Math.round(percentage * (numPages - 1)) + 1));
-
-              // Navigate to the page
-              targetPageRef.current = targetPage;
-              onPageChange(targetPage);
-
-              // Load pages around target (PAGE_BUFFER = 5)
-              const startPage = Math.max(1, targetPage - PAGE_BUFFER);
-              const endPage = Math.min(numPages, targetPage + PAGE_BUFFER);
-              const newLoadedPages = new Set<number>();
-              for (let i = startPage; i <= endPage; i++) {
-                newLoadedPages.add(i);
-              }
-              setLoadedPages(newLoadedPages);
-
-              // Scroll to the page
-              setTimeout(() => {
-                scrollToPage(targetPage);
-                setTimeout(() => {
-                  targetPageRef.current = null;
-                }, 500);
-              }, 50);
+              navigateToPage(targetPage);
             }}
           >
-            {/* Progress fill */}
+            {/* Progress bar */}
             <div style={{
               position: 'absolute',
               left: 0,
               top: 0,
               height: '100%',
-              width: `${((currentPage - 1) / (numPages - 1 || 1)) * 100}%`,
+              width: `${scrollRatio * 100}%`,
               background: 'var(--accent-color)',
               borderRadius: '4px',
-              transition: isDraggingScrollbar ? 'none' : 'width 0.15s ease',
+              transition: 'width 0.1s ease',
             }} />
 
             {/* Draggable thumb */}
             <div
               style={{
                 position: 'absolute',
-                left: `${((currentPage - 1) / (numPages - 1 || 1)) * 100}%`,
+                left: `${scrollRatio * 100}%`,
                 top: '50%',
                 transform: 'translate(-50%, -50%)',
                 width: '16px',
@@ -625,52 +661,25 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
                 borderRadius: '50%',
                 cursor: 'grab',
                 boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
-                transition: isDraggingScrollbar ? 'none' : 'transform 0.15s ease',
+                transition: 'transform 0.1s ease',
               }}
               onMouseDown={(e) => {
                 e.preventDefault();
-                setIsDraggingScrollbar(true);
+                const rect = e.currentTarget.parentElement?.getBoundingClientRect();
+                if (!rect) return;
 
                 const handleMouseMove = (moveEvent: MouseEvent) => {
-                  if (!scrollbarTrackRef.current) return;
-
-                  const trackRect = scrollbarTrackRef.current.getBoundingClientRect();
-                  const percentage = Math.max(0, Math.min(1, (moveEvent.clientX - trackRect.left) / trackRect.width));
-                  const targetPage = Math.max(1, Math.min(numPages, Math.round(percentage * (numPages - 1)) + 1));
-
-                  // Only update if page actually changed
-                  if (targetPage !== currentPage) {
-                    // Set target to prevent scroll interference
-                    targetPageRef.current = targetPage;
-
-                    // Update page state immediately for responsive UI
-                    onPageChange(targetPage);
-
-                    // Load pages around target only (PAGE_BUFFER = 5)
-                    const startPage = Math.max(1, targetPage - PAGE_BUFFER);
-                    const endPage = Math.min(numPages, targetPage + PAGE_BUFFER);
-                    const newLoadedPages = new Set<number>();
-                    for (let i = startPage; i <= endPage; i++) {
-                      newLoadedPages.add(i);
-                    }
-                    setLoadedPages(newLoadedPages);
-                  }
+                  const percentage = Math.max(0, Math.min(1, (moveEvent.clientX - rect.left) / rect.width));
+                  setScrollRatio(percentage);
+                  const targetPage = Math.max(1, Math.min(numPages, Math.ceil(percentage * (numPages - 1)) + 1));
+                  displayPageRef.current = targetPage;
+                  setDisplayPage(targetPage);
                 };
 
                 const handleMouseUp = () => {
-                  setIsDraggingScrollbar(false);
-
-                  // Scroll to the final page after drag ends
-                  setTimeout(() => {
-                    if (targetPageRef.current !== null) {
-                      scrollToPage(targetPageRef.current);
-                      // Clear target after scroll completes
-                      setTimeout(() => {
-                        targetPageRef.current = null;
-                      }, 500);
-                    }
-                  }, 50);
-
+                  const percentage = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  const targetPage = Math.max(1, Math.min(numPages, Math.round(percentage * (numPages - 1)) + 1));
+                  navigateToPage(targetPage);
                   document.removeEventListener('mousemove', handleMouseMove);
                   document.removeEventListener('mouseup', handleMouseUp);
                 };
@@ -682,7 +691,7 @@ const PDFViewer = forwardRef<PDFViewerRef, PDFViewerProps>(function PDFViewer({
           </div>
 
           <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', minWidth: '60px', textAlign: 'right' }}>
-            {currentPage}/{numPages}
+            {displayPage}/{numPages}
           </span>
         </div>
       </div>
